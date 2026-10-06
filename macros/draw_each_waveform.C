@@ -1,3 +1,5 @@
+
+#include <HCal.hpp>
 // ROOT 
 #include <ROOT/RDataFrame.hxx>
 #include <ROOT/RDFHelpers.hxx>
@@ -13,6 +15,7 @@
 #include <Math/ProbFuncMathCore.h>
 #include <TString.h> 
 #include <TBox.h>
+#include <TAxis.h> 
 // analysis_utils
 #include <analysis_utils/ROOT.hpp>
 // stdlib
@@ -21,6 +24,7 @@
 #include <array> 
 #include <cmath> 
 #include <memory> 
+#include <limits> 
 #include <iostream> 
 
 namespace {
@@ -31,27 +35,64 @@ namespace {
     constexpr double min_amplitude = 1e-25; 
 }; 
 
-struct Waveform {
-    std::array<double, n_samples> data;
-    double& operator()(int i) { return data[i]; } 
-    const double& operator()(int i) const { return data[i]; }
-}; 
 
-struct HCalEvent {
-    std::array<Waveform, n_rows*n_cols> blocks; 
+double max_variance_subrange(const HCal::Block& b, int window_size=8) 
+{
+    double norm = 1./((double)window_size); 
 
-    Waveform& get_block(int row, int col) { return blocks[row*n_cols + col]; }
-    const Waveform& get_block(int row, int col) const { return blocks[row*n_cols + col]; }
-}; 
+    const int n_steps = HCal::Block::n_waveform_samps - window_size; 
+
+    const auto& wf = b.samps; 
+
+    double max_variance = -1.; 
+    for (int i=0; i<n_steps; i++) {
+
+        double sum{0.}, sum2{0.};  
+        for (int j=i; j<i+window_size; j++) {
+            sum  += wf[j]; 
+            sum2 += wf[j]*wf[j]; 
+        }
+
+        sum *= norm; sum2 *= norm; 
+
+        if (double variance = (sum2 - sum*sum); variance > max_variance) {
+            max_variance = variance; 
+        }
+    }
+    return max_variance; 
+}
+
+
+double get_median(TH1D* h) {
+    double integral = h->Integral(); 
+    auto xax = h->GetXaxis(); 
+    double sum=0.; 
+    for (int ix=1; ix<=xax->GetNbins(); ix++) {
+        double val = h->GetBinContent(ix)/integral; 
+        if (val + sum >= 0.5) {
+            double step_size = val;
+            double overshoot = val + sum - 0.5; 
+
+            double x0 = xax->GetBinCenter(ix-1); 
+            double dx = xax->GetBinWidth(1); 
+
+            return x0 + dx*((val - overshoot)/val); 
+        }
+        sum += val; 
+    }
+
+    //something went wrong, if we got here
+    return std::numeric_limits<double>::quiet_NaN(); 
+}
+
+template<typename T> using block_rptr = std::array<ROOT::RDF::RResultPtr<T>, HCal::n_blocks>; 
 
 void draw_each_waveform(
-    std::string path_infile="data/e1209016_replayed_2034_stream0_2_seg0_0_firstevent0_nevent10000.root", 
-    std::string path_out_graphic="plots/waveforms_test"
+    std::string path_infile="waveforms.root", 
+    std::string path_out_graphic="plots/waveform_log_variance"
 )
 {
     using ROOT::VecOps::RVec; 
-
-
 
     ROOT::EnableImplicitMT(); 
 
@@ -60,6 +101,147 @@ void draw_each_waveform(
     ROOT::RDF::Experimental::AddProgressBar(df); 
     //now, create the 'hcal' objects
 
+    block_rptr<TH1D> histos; //[HCal::n_blocks]; 
+    block_rptr<TH1D> h_variance; //[HCal::n_blocks]; 
+    block_rptr<TH1D> h_log_variance; //[HCal::n_blocks]; 
+    block_rptr<TH1D> h_subrange_log_variance; //[HCal::n_blocks]; 
+
+    block_rptr<double> b_variance2, b_variance; 
+
+    const int subrange_size = 4; 
+
+    path_out_graphic += ".pdf"; 
+    std::cout << "booking histograms..." << std::flush; 
+    for (int row=0; row<HCal::n_rows; row++) {
+        for (int col=0; col<HCal::n_cols; col++) {
+        
+            double norm_fact = 1./((double)HCal::Block::n_waveform_samps); 
+
+            const int ind = row*HCal::n_cols + col; 
+    
+            auto df_samps = df
+                
+                    .Define("my_samps", [row,col](const HCal& d){ 
+                        const auto& block = d.get_block(row,col); 
+                        return RVec<double>( block.samps.cbegin(), block.samps.cend() ); 
+                    }, {"hcal_data"})
+
+                    .Define("samp_variance", [norm_fact](const RVec<double>& v){
+                        double xx{0.}, x{0.}; 
+                        for (double xi : v) { xx += xi*xi; x += xi; }
+                        xx *= norm_fact; 
+                        x  *= norm_fact; 
+                        return xx - x*x; 
+                    }, {"my_samps"})
+
+                    .Define("subrange_variance", [row,col,subrange_size](const HCal& d)
+                    {
+                        return max_variance_subrange(d.get_block(row,col), subrange_size); 
+                    }, {"hcal_data"})
+
+                    .Define("log_subrange_variance", [](double var){ return std::log10(var); }, {"subrange_variance"})
+
+                    .Define("samp_log_variance", [](double var){ return std::log10(var); }, {"samp_variance"})
+
+                    .Define("samp_variance2", [](double var){ return var*var; }, {"samp_variance"}); 
+
+            b_variance[ind] = df_samps.Sum<double>("samp_variance");
+            b_variance2[ind] = df_samps.Sum<double>("samp_variance2");  
+
+            histos[ind] = df_samps   
+                .Histo1D<RVec<double>>({"h_draw", Form("All waveforms for row %4i, col %4i;waveform amplitude;",row,col), 200, -2.5e-2, +2.5e-2}, "my_samps"); 
+                    
+            h_subrange_log_variance[ind] = df_samps
+                .Histo1D<double>({"h_log_subrange_variance", Form(
+                    "Max-window Variance of waveform samples: row %4i, col %4i;log_{10}( max[ <x_{i}^{2}> - <x_{i}>^{2} ] );",row,col), 
+                    100, -8, 1}, "log_subrange_variance");
+            
+            h_log_variance[ind] = df_samps
+                .Histo1D<double>({"h_log_variance", 
+                    Form("Variance of waveform samples: row %4i, col %4i;log_{10}( max[ <x_{i}^{2}> - <x_{i}>^{2} ] );",row,col), 
+                    100, -8, 1}, "samp_log_variance");
+            
+            h_variance[ind] = df_samps
+                .Histo1D<double>({"h_variance", 
+                    Form("Max-window Variance of waveform samples: row %4i, col %4i;max[ <x_{i}^{2}> - <x_{i}>^{2} ];",row,col), 
+                    100, 0., 5e-5}, "log_subrange_variance");
+        }
+    }
+    std::cout << "done.\n"; 
+
+    auto count = *df.Count(); 
+
+    std::printf("done fetching %.4e events.\ndrawing...\n", (double)count); 
+
+    auto canv = new TCanvas; 
+    
+    std::vector<double> pts_median(HCal::n_blocks), pts_stddev(HCal::n_blocks); 
+
+    int page=0; 
+    for (int row=0; row<HCal::n_rows; row++) {
+        for (int col=0; col<HCal::n_cols; col++) {
+
+            const int ind = row*HCal::n_cols + col; 
+
+            auto& h = h_log_variance[ind]; 
+
+            auto& h_log = h_log_variance[ind]; 
+
+            canv->Clear(); 
+            canv->SetLogy(1); 
+
+            h->DrawCopy(); 
+            
+            canv->Modified(); 
+            canv->Update(); 
+
+            //compute the median
+            double median = std::pow( 10., get_median(&(*h_log)) ); 
+
+            double var  = *b_variance[ind] / ((double)count); 
+            double var2 = *b_variance2[ind] / ((double)count); 
+
+            double stddev = std::sqrt( var2 - (var*var) ); 
+
+            pts_median[ind] = median; 
+            pts_stddev[ind] = stddev; 
+
+            std::printf("block id: %3i (row-%02i, col-%02i): median, stddev: (of samp. variance): %.4e %.4e\n",
+                ind, row, col, 
+                median, stddev
+            ); 
+
+            //save each 'file' to a pdf
+            ++page; 
+            switch (page) {
+
+                //first page 
+                case 1 : 
+                    canv->Print(std::string{path_out_graphic + "["}.c_str(), "pdf"); break; 
+                
+                //last page
+                case (HCal::n_blocks) : 
+                    canv->Print(std::string{path_out_graphic + "]"}.c_str(), "pdf"); break; 
+
+                //any other page
+                default : 
+                    canv->Print(path_out_graphic.c_str(), "pdf"); 
+            }
+        } 
+    }
+
+    canv = new TCanvas; 
+    canv->SetLogx(1); 
+    canv->SetLogy(1); 
+    auto g = new TGraph(HCal::n_blocks, pts_median.data(), pts_stddev.data()); 
+    g->SetTitle("Median variance of each block vs. Stddev;Median variance of waveforms (per-block);Sttdev variance of waveforms (per-block)");
+    g->SetMarkerStyle(kOpenCircle); 
+    g->Draw("AP"); 
+
+
+    return; 
+
+#if 0 
     auto events = *df    
 
         .Filter([](const RVec<double>& raw_waveforms){ 
@@ -293,4 +475,6 @@ void draw_each_waveform(
 
     std::printf("evt. num highest block: row %3i     col %3i\n", irow,icol); 
     return;
+#endif
+
 }
